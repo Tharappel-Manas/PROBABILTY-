@@ -113,6 +113,13 @@ import torch
 print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
 ```
 
+## Quick sample run (implemented PostNet only)
+`sample_run.py` builds a tiny `sample_data_corruptions/` dataset (`simulator_domain.npz`, `calibration_set.npz`, `real_held_out_test.npz`) using deterministic PIL corruptions (brightness, contrast, gaussian_blur, motion_blur, jpeg), trains PostNet for a few epochs, saves `postnet_sample.pt`, and prints held-out corrupted accuracy plus aleatoric/epistemic summaries.
+```bash
+pip install -r requirements.txt   # Pillow/PIL required (install with: pip install pillow if missing)
+python sample_run.py
+```
+
 ## Team
 
 | Member | Role |

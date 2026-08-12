@@ -1,133 +1,202 @@
-# FlowPost
-### Calibrated Uncertainty under Simulation-to-Reality Shift
+# Flow Posterior for Uncertainty Estimation
 
-A hybrid probabilistic deep learning pipeline that combines **Flow Matching**, **Posterior Networks (PostNet)**, and a **Bayesian Network (pgmpy)** decision layer to make trustworthy, uncertainty-aware predictions when a model trained on simulated data is deployed on real-world data.
+A hybrid uncertainty-estimation pipeline combining a **Posterior Network
+(PostNet)** for density-based epistemic and aleatoric uncertainty, a
+lightweight **Flow Matching calibration step (FMCPE-lite)** for correcting
+simulation-to-reality domain shift, and a **pgmpy Bayesian decision network**
+that turns uncertainty into an explainable Trust / Flag / Reject decision.
 
 ---
 
-## Problem
+## Problem Statement
 
-Deep learning models are often trained on simulator-generated data because collecting large volumes of real-world data is expensive or impractical. But simulators never match the real world exactly — this is called **model misspecification**. A model trained purely on simulated data can be confidently wrong when deployed on real observations, which is dangerous in domains where decisions have real consequences.
+Standard deep learning classifiers output a single confidence score and are
+frequently overconfident on inputs that differ from their training
+distribution — they have no principled way to say "I don't know." Most
+existing approaches to fixing this require exposing the model to
+out-of-distribution (OOD) examples during training, which is often
+impractical: you rarely know in advance what your model will fail on.
 
-## Domain & Application
+This project asks two questions:
 
-This project uses an **epidemic (SIR) simulator** as its case study.
+1. Can a model learn to recognize unfamiliar inputs **without ever training
+   on OOD data**, purely by modeling the density of "normal" data in its own
+   learned representation?
+2. When that model is deployed on data that has drifted from its training
+   distribution (a common industrial problem — simulators and clean
+   benchmarks rarely match messy real-world inputs), can a small,
+   inexpensive calibration step correct for that gap, and can the resulting
+   uncertainty be turned into an auditable decision rather than a raw
+   confidence number?
 
-- A clean SIR simulator generates idealized infection curves and is used to train PostNet.
-- Real-world epidemic reporting is noisy: cases are **under-reported** and **delayed**. A small calibration set of "real-like" noisy/delayed curves is used to train the Flow Matching correction network.
-- The task: given a 30-day infection curve, classify the outbreak severity and produce a calibrated, trustworthy decision — not just a raw label.
+---
+
+## Our Contribution
+
+PostNet and FMCPE are each existing, individually published methods. This
+project's contribution is combining them, and adding a decision layer on
+top, in a way not found together in the literature:
+
+- **PostNet** provides OOD-free epistemic uncertainty via density estimation
+  in latent space, rather than needing adversarial OOD sampling or ensemble
+  methods.
+- **FMCPE-lite** adds a lightweight, input-space correction for
+  simulation-to-reality domain shift — instead of the full two-transport-map
+  machinery of the original FMCPE paper, only the observation-space map is
+  learned, using a small real-world calibration set.
+- **pgmpy decision layer** converts PostNet's raw uncertainty into a
+  probabilistic Bayesian Network over discretized evidence, then applies an
+  expected-utility decision rule (`argmax_action EU(action)`) to produce an
+  explainable Trust / Flag / Reject output — moving from "the model is
+  uncertain" to "here is the recommended action and why."
+
+This combination targets a genuinely practical gap: evidential deep learning
+models are usually evaluated assuming training and deployment data are
+perfectly aligned, which rarely holds in practice.
+
+---
+
+## Domain
+
+- **Simulator (clean) domain:** CIFAR-10 — abundant, well-behaved training
+  data, standing in for a "clean" or simulated data source.
+- **Real/shifted domain:** CIFAR-10-C — corrupted CIFAR-10 variants (noise,
+  blur, fog, brightness, etc. at varying severity), standing in for
+  real-world, distribution-shifted deployment data.
+- **theta:** corruption type + severity (1-5)
+- **x:** the 32x32x3 corrupted image itself
+
+CIFAR-10/CIFAR-10-C was chosen because it is classification-native (matches
+PostNet directly), has well-documented, reproducible corruption benchmarks,
+and keeps data-engineering overhead low so effort stays focused on the
+uncertainty method itself.
+
+---
 
 ## Architecture
 
 ```
-                     SIMULATION STAGE
-   SIR Simulator (β, γ) → Clean Infection Curves → Train PostNet
-
-
-                     DEPLOYMENT STAGE
-   Real-world Observation (noisy, under-reported, delayed)
-                       │
-                       ▼
-     Small Calibration Dataset → Observation Flow (TX)
-              (Flow Matching: real → simulator-aligned)
-                       │
-                       ▼
-              Simulation-aligned Observation
-                       │
-                       ▼
-                  Encoder (PostNet)
-                       │
-                       ▼
-            Latent Representation (z)
-                       │
-                       ▼
-        Normalizing Flow → P(z | class)
-                       │
-                       ▼
-        Density-based Pseudo-Counts (β)
-                       │
-                       ▼
-        Dirichlet Posterior Distribution
-                       │
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
-   Prediction   Aleatoric UQ    Epistemic UQ
-        │              │              │
-        └──────────────┴──────────────┘
-                       │
-                       ▼
-        pgmpy Bayesian Network (Decision Layer)
-                       │
-                       ▼
-     Final Decision: Trust / Flag for Review / Reject
+              clean CIFAR-10 (simulator domain)
+                        |
+                        v
+          --------------------------------
+          |   PostNet training           |
+          |   Encoder -> class-cond.     |
+          |   Normalizing Flow -> P(z|c) |
+          |   -> Dirichlet pseudo-counts |
+          --------------------------------
+                        |
+        CIFAR-10-C (real/shifted, held out)
+                        |
+                        v
+          --------------------------------
+          |   TX: Flow Matching (lite)   |
+          |   corrupted -> clean-style   |
+          --------------------------------
+                        |
+                        v
+          --------------------------------
+          |   PostNet (frozen, trained   |
+          |   on clean data only)        |
+          --------------------------------
+                        |
+        prediction + aleatoric/epistemic uncertainty
+                        |
+                        v
+          --------------------------------
+          |   pgmpy Bayesian Network     |
+          |   uncertainty + context ->    |
+          |   P(prediction correct)       |
+          --------------------------------
+                        |
+                        v
+          --------------------------------
+          |   Utility / Decision layer   |
+          |   EU(action) = sum_state      |
+          |   P(state|evidence) x         |
+          |   utility(state,action)       |
+          --------------------------------
+                        |
+                        v
+          Decision: argmax_action EU(action)
+                -> Trust / Flag / Reject
 ```
 
-### Components
+**How PostNet works, briefly:** an encoder maps each image to a low-dimensional
+latent vector `z`. A class-conditional normalizing flow estimates `P(z|c)`
+for every class via the change-of-variables formula. This density is
+converted into Dirichlet pseudo-counts, `beta_c = N_c * P(z|c)`, giving
+Dirichlet parameters `alpha_c = beta_c + 1`. From the resulting
+`Dir(alpha)` distribution, PostNet reads off two separate uncertainty
+signals: **aleatoric** (entropy of the expected class probabilities — data
+is inherently ambiguous) and **epistemic** (inverse of total evidence — the
+model hasn't seen enough like this). The model is trained with the UCE
+(uncertain cross-entropy) loss, the closed-form expected cross-entropy under
+the Dirichlet posterior.
 
-| Component | Type | Role |
-|---|---|---|
-| SIR Simulator | — | Generates synthetic (θ, x) training pairs |
-| Flow Matching (TX) | Deep Learning | Aligns real, noisy observations to the simulator's distribution |
-| Encoder | Deep Learning | Extracts features from the (aligned) observation |
-| Normalizing Flow | Deep Learning | Estimates class-conditional density P(z\|class) |
-| Dirichlet Posterior | Probabilistic Reasoning | Converts density into calibrated prediction + uncertainty |
-| pgmpy Bayesian Network | Probabilistic Reasoning | Fuses uncertainty + context into an interpretable decision |
+---
 
-## Parameters
 
-- **θ (simulator parameters):** infection rate `β ~ U(0.1, 0.9)`, recovery rate `γ ~ U(0.05, 0.5)`; `R0 = β / γ`
-- **Class labels:** `R0 < 1` → Controlled | `1 ≤ R0 < 2` → Moderate spread | `R0 ≥ 2` → High spread
-- **x (observation):** 30-day daily new-infection count vector
-  - Simulator version: clean SIR curve
-  - Calibration/"real" version: under-reported (60–80% capture) + delayed/smoothed curve
-
-## Novelty
-
-Standard FMCPE uses two correction flows (input correction + posterior correction). This project keeps only the input-correction flow (TX) and replaces the posterior-correction flow with PostNet's density-based evidential uncertainty — testing whether PostNet's built-in confidence estimation makes the second flow unnecessary. A pgmpy decision layer is added on top to turn raw uncertainty numbers into an explicit, interpretable action.
+---
 
 ## Repository Structure
 
 ```
-flowpost/
-├── data/           # Simulated + calibration datasets
-├── src/            # Source code (simulator, TX, PostNet, pgmpy network)
-├── notebooks/       # Exploratory / training notebooks
-├── results/         # Metrics, plots, saved checkpoints
-├── requirements.txt
-└── README.md
+data_pipeline/
+  phase1_data_pipeline.py   - builds simulator/calibration/held-out splits
+  phase1_eda.py              - exploratory data analysis on the splits
+postnet/
+  phase2_postnet.py          - Encoder, class-conditional flows, Dirichlet
+                                pseudo-counts, UCE loss, PostNet model
+  phase2_evaluate.py         - correct-vs-wrong uncertainty sanity check
+  phase2_shift_eval.py       - clean-vs-CIFAR-10-C shift experiment
+  phase2_flow_audit.py       - flow invertibility + discriminative density checks
+results/
+  headline_result.npz        - raw uncertainty/correctness arrays
+  plot1_epistemic_histogram.png
+  plot2_accuracy_vs_uncertainty.png
+sample_run.py                 - quick end-to-end smoke test
+requirements.txt
 ```
+
+---
 
 ## Setup
 
 ```bash
-git clone https://github.com/<your-username>/flowpost.git
-cd flowpost
-conda create -n flowpost python=3.10
-conda activate flowpost
 pip install -r requirements.txt
 ```
 
-Confirm GPU availability:
-```python
-import torch
-print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
-```
+Run the data pipeline, then PostNet training/evaluation scripts in
+`postnet/`, in order. `sample_run.py` provides a quick smoke test of the
+full pipeline on a small subset of data.
 
-## Quick sample run (implemented PostNet only)
-`sample_run.py` builds a tiny `sample_data_corruptions/` dataset (`simulator_domain.npz`, `calibration_set.npz`, `real_held_out_test.npz`) using deterministic PIL corruptions (brightness, contrast, gaussian_blur, motion_blur, jpeg), trains PostNet for a few epochs, saves `postnet_sample.pt`, and prints held-out corrupted accuracy plus aleatoric/epistemic summaries.
-```bash
-pip install -r requirements.txt   # Pillow/PIL required (install with: pip install pillow if missing)
-python sample_run.py
-```
+---
+
+## Related Work & Scope
+
+PostNet and FMCPE build on existing published methods (density-based
+evidential deep learning and flow-based posterior correction,
+respectively). Two related directions were considered and deliberately
+excluded from this project:
+
+- **floZ (Bayesian evidence estimation)** — requires a fully validated
+  posterior estimator as a prerequisite, plus a physics domain (e.g.
+  gravitational wave data) outside this project's scope.
+- **Manifold-valued flows** — only relevant for inherently directional or
+  spherical data, which image classification is not; would add Riemannian
+  geometry machinery with no benefit here.
+- **Multiplicative Normalizing Flows (MNF)** — a competing architecture to
+  PostNet for epistemic uncertainty, solving the same problem rather than
+  complementing it.
+
+---
 
 ## Team
 
-| Member | Role |
-|---|---|
-| Manas | Simulator, PostNet training (GPU-heavy), baseline evaluation |
-| Zahwa | Flow Matching (TX), pgmpy decision layer, integration support |
-| Both | Integration, evaluation, report, presentation |
-
+- **Manas** — PostNet training, flow implementation, Dirichlet/UCE loss,
+  verification and evaluation
+- **Zahwa** — data pipeline, calibration set construction, EDA
 ## References
 
 1. Barzilai, D., Elhadad, T., et al. "Flow Matching Calibration for Simulation-Based Inference under Model Misspecification." *ICML 2026.*
